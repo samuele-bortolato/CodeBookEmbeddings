@@ -139,7 +139,7 @@ class ApproxEmbed(torch.nn.Module):
 
 
 
-def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=100, save_path='', optimizer=None, verbose=False, device='cuda'):
+def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=100, save_path='', optimizer=None, norm=2, verbose=False, device='cuda'):
     
     if optimizer is None:
         optimizer=torch.optim.Adam(apx.parameters(),lr=0.01)
@@ -161,7 +161,7 @@ def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=1
             embed_preds = apx(positions)
 
             embeds = embeddings[positions]
-            loss=torch.mean(torch.square(embed_preds-embeds))
+            loss=torch.mean(torch.pow(torch.abs(embed_preds)-embeds, norm))
 
             loss.backward()
             optimizer.step()
@@ -256,7 +256,7 @@ def plot_compare_result_runs(runs, embeddings, bits=8):
     fig, ax = plt.subplots(figsize=(15,10))
     for l in levs.keys():
         print(l)
-        size= np.array([calc_size([run['apx'].B.dictionary, list(run['apx'].N.parameters())])+ run['level']*embeddings.shape[0]*bits/8 for run in levs[l]])/1e6
+        size= np.array([calc_size(list(run['apx'].parameters())) for run in levs[l]])/1e6
         loss = np.array([np.min(run['loss']) for run in levs[l]])
         idx = np.argsort(size)
         snr = 10*np.log10(max_s/loss)

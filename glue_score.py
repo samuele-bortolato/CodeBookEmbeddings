@@ -66,7 +66,7 @@ def validate(model, tokenizer,val_dataloader, metrics, args, device='cuda'):
     model.train()
     return results
 
-def Glue(model, tokenizer, task_name, args, epochs=10, lr=1e-5, batch_size=32, steps_validate=0.25, device='cuda'):
+def get_dataloaders(args, task_name, batch_size):
 
     train_dataset = datasets.load_dataset("glue", task_name, split="train")
     if 'val_datasets' in args.keys():
@@ -77,6 +77,9 @@ def Glue(model, tokenizer, task_name, args, epochs=10, lr=1e-5, batch_size=32, s
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_dataloader = [DataLoader(v_d, batch_size=batch_size, shuffle=False) for v_d in val_dataset]
 
+    return train_dataloader,val_dataloader
+
+def get_metrics(args, device='cuda'):
     if 'num_classes' not in args.keys():
         args['num_classes']=2
     metrics = []
@@ -91,6 +94,13 @@ def Glue(model, tokenizer, task_name, args, epochs=10, lr=1e-5, batch_size=32, s
             metrics.append(torchmetrics.PearsonCorrCoef().to(device))
         elif metric=='Spearman':
             metrics.append(torchmetrics.SpearmanCorrCoef().to(device))
+    return metrics
+
+def Glue(model, tokenizer, task_name, args, epochs=10, lr=1e-5, batch_size=32, steps_validate=0.25, device='cuda'):
+
+    train_dataloader,val_dataloader = get_dataloaders(args, task_name, batch_size)
+
+    metrics = get_metrics(args)
 
     if args['type']=='regression':
         if 'min' not in args.keys():
