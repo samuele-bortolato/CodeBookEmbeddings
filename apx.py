@@ -144,6 +144,11 @@ def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=1
     if optimizer is None:
         optimizer=torch.optim.Adam(apx.parameters(),lr=0.01)
 
+    if norm==2:
+        name = str(apx.B.levels) + '_' + str(apx.B.feature_dim) + '.pth'
+    else:
+        name = str(apx.B.levels) + '_' + str(apx.B.feature_dim) + '_norm' + norm + '.pth'
+
     h=[]
     run={}
     run['level']=apx.B.levels
@@ -181,10 +186,10 @@ def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=1
             if tot_loss<best_loss:# save the best model
                 best_loss=tot_loss
                 run['apx']=apx.state_dict()
-                torch.save(run, save_path + str(run['level']) + '_' + str(run['channel'])+'.pth')
+                torch.save(run, save_path + name)
     if verbose:
         print()
-    apx.load_state_dict(torch.load(save_path + str(run['level']) + '_' + str(run['channel'])+'.pth')['apx'])
+    apx.load_state_dict(torch.load(save_path + name)['apx'])
     run['apx']=apx
     return run
 

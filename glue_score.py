@@ -96,9 +96,10 @@ def get_metrics(args, device='cuda'):
             metrics.append(torchmetrics.SpearmanCorrCoef().to(device))
     return metrics
 
-def Glue(model, tokenizer, task_name, args, epochs=10, lr=1e-5, batch_size=32, steps_validate=0.25, device='cuda'):
+def Glue(model, tokenizer, task_name, args, epochs=10, lr=1e-5, batch_size=32, steps_validate=0.25, train_dataloader=None, val_dataloader=None, device='cuda'):
 
-    train_dataloader,val_dataloader = get_dataloaders(args, task_name, batch_size)
+    if train_dataloader is None or val_dataloader is None:
+        train_dataloader,val_dataloader = get_dataloaders(args, task_name, batch_size)
 
     metrics = get_metrics(args)
 
@@ -182,7 +183,7 @@ def plot(H, V=None):
     plt.show()
 
 
-def plot_results(run_dict):
+def plot_results_retrain(run_dict):
     styles=['--',':']
 
     for task in run_dict.keys():
@@ -213,3 +214,4 @@ def plot_results(run_dict):
                     else:
                         plt.plot([x/H['batch_per_epoch'] for x,y in VH],[y[j] for x,y in VH],styles[j], color=colors[i], alpha=0.7)
             plt.legend([*V['metrics']])
+
