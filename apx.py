@@ -186,6 +186,8 @@ def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=1
             if tot_loss<best_loss:# save the best model
                 best_loss=tot_loss
                 run['apx']=apx.state_dict()
+                if not os.path.exists(save_path):
+                    os.makedirs(save_path)
                 torch.save(run, save_path + name)
     if verbose:
         print()

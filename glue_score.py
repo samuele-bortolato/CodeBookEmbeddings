@@ -197,7 +197,7 @@ def plot_results_retrain(run_dict):
             H=runs[run]['history']
             h=H['history']
             n=len(h)//10
-            plt.plot(np.arange(len(h))/H['batch_per_epoch'],h, color=colors[i], alpha=0.3)
+            plt.plot(np.arange(len(h))/H['batch_per_epoch'],h, color=colors[i], alpha=0.2)
             h1= np.convolve(h, np.ones(n)/n, mode='same')/(np.convolve(np.ones(len(h)), np.ones(n)/n, mode='same')+1e-7)
             plt.plot((np.arange(len(h1))+len(h)-len(h1))/H['batch_per_epoch'],h1, color=colors[i], label=run)
             ax.xaxis.set_major_locator(MaxNLocator(integer=True))
