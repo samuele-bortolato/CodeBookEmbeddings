@@ -5,6 +5,26 @@ import os
 import math
 import matplotlib.pyplot as plt
 import time
+import random 
+
+def set_random_seed(random_seed: int = 42) -> None:
+    """Set the random seed for reproducibility. The seed is set for the random library, the numpy library and the pytorch 
+    library. Moreover the environment variable `TF_DETERMINISTIC_OPS` is set as "1".
+
+    Parameters
+    ----------
+    random_seed : int, optional
+        The random seed to use for reproducibility (default 42).
+    """
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    torch.cuda.manual_seed(random_seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
 
 class ApxSVD(torch.nn.Module):
     def __init__(self, 
@@ -27,25 +47,32 @@ class Indexing(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_fwd(cast_inputs=torch.half)
     def forward(ctx, embeds, scores):
-        ctx.save_for_backward(embeds, scores)
         # embeds.shape                                              # (L, W, C)
         s = scores.shape                                            # (L, B, W)
         idx = scores.max(-1)[1].T                                   # (B, L)
         idx = idx.reshape(-1)                                       # (B*L)
         out = embeds[list((torch.arange(s[0]).repeat(s[1]), idx))]  # (B*L, C)
         out = out.reshape(s[1],-1)                                  # (B, L*C)
+        ctx.save_for_backward(embeds, idx)
         return out
 
     @staticmethod
     @torch.cuda.amp.custom_bwd
     def backward(ctx, grad_output):
-        embeds, scores = ctx.saved_tensors
-        grad_output=grad_output.view(-1, embeds.shape[0], embeds.shape[2])
+        embeds, idx = ctx.saved_tensors
+        grad_output=grad_output.view(-1, embeds.shape[0], embeds.shape[2]) #(B,L,C)
 
         grad_embeds = grad_scores = None
 
         if ctx.needs_input_grad[0]:
-            grad_embeds = torch.bmm(scores.permute(0,2,1), grad_output.permute(1,0,2))
+            grad_embeds = torch.zeros(embeds.shape[1],
+                                      embeds.shape[0],
+                                      embeds.shape[2],
+                                      device=grad_output.device, 
+                                      dtype=grad_output.dtype)      # (W, L, C)
+            idx = idx.view(-1,embeds.shape[0],1)                    # (B, L, 1)
+            grad_embeds.scatter_add_(0,idx,grad_output)
+            grad_embeds=grad_embeds.permute(1,0,2)                  # (L, W, C)
 
         if ctx.needs_input_grad[1]:
             grad_scores = torch.bmm(grad_output.permute(1,0,2), embeds.permute(0,2,1))
@@ -89,8 +116,9 @@ class CodeBook(torch.nn.Module):
             return out
     
     def fix_indices(self):
-        self.fixed_indices = nn.Parameter((self.feats.max(-1)[1]).to(torch.int8).T, requires_grad=False)
-        self.feats = None
+        if self.feats is not None:
+            self.fixed_indices = nn.Parameter((self.feats.max(-1)[1]).to(torch.int8).T, requires_grad=False)
+            self.feats = None
 
 
 class ApproxEmbed(torch.nn.Module):
@@ -136,18 +164,110 @@ class ApproxEmbed(torch.nn.Module):
     def fix_indices(self):
         self.B.fix_indices()
 
+class CodeBook2(torch.nn.Module):
+
+    def __init__(self, 
+        levels, 
+        feature_dim,
+        num_words,
+        feature_std         : float        = 1.0,
+        feature_bias        : float        = 0.0,
+        codebook_bitwidth=8):
+
+        super().__init__()
+
+        self.levels=levels
+        self.feature_dim=feature_dim
+        self.num_words=num_words
+        self.feature_std=feature_std
+        self.feature_bias=feature_bias
+        self.bitwidth=codebook_bitwidth//2
+
+        self.dictionary_size = 2 ** self.bitwidth
+        self.dictionary = nn.Parameter(torch.randn(self.levels, self.dictionary_size**2, self.feature_dim) * self.feature_std + self.feature_bias)
+        self.feats0=nn.Parameter(torch.randn(self.levels, self.num_words, self.dictionary_size))
+        self.feats1=nn.Parameter(torch.randn(self.levels, self.num_words, self.dictionary_size))
+        self.indexing_func=Indexing.apply
+    
+    def forward(self, idx):
+        f0=self.feats0[:,idx.long()][...,None]
+        f1=self.feats1[:,idx.long()][...,None,:]
+        S=f0.shape
+        logits=(f0*f1).reshape(S[0],S[1],-1)
+        return self.indexing_func(self.dictionary, logits)
+
+    def fix_indices(self):
+        if self.feats0 is not None:
+            f0=self.feats0[...,None]
+            f1=self.feats1[...,None,:]
+            S=f0.shape
+            self.fixed_indices = nn.Parameter(((f0*f1).reshape(S[0],S[1],-1).max(-1)[1]).to(torch.int8).T, requires_grad=False)
+            self.feats0 = None
+            self.feats1 = None
+
+
+class ApproxEmbed2(torch.nn.Module):
+    def __init__(self, 
+        levels, 
+        feature_dim,
+        num_words,
+        output_dims,
+        feature_std         : float        = 1.0,
+        feature_bias        : float        = 0.0,
+        codebook_bitwidth=8,
+        neurons=64,
+        nn_levels=2):
+        
+        super().__init__()
+   
+        self.B=CodeBook2(levels, 
+                        feature_dim,
+                        num_words,
+                        feature_std= feature_std,
+                        feature_bias= feature_bias,
+                        codebook_bitwidth=codebook_bitwidth)
+
+        # self.B=torch.compile(self.B,
+        #             mode='max-autotune',
+        #             fullgraph=True)
+        
+        self.N=torch.nn.Sequential()
+
+        prec_dim = feature_dim*levels
+        for i in range(nn_levels):
+            self.N.append(torch.nn.Linear(prec_dim, neurons))
+            self.N.append(torch.nn.LeakyReLU())
+            prec_dim = neurons
+        self.N.append(torch.nn.Linear(prec_dim, output_dims))
+
+    def forward(self, idx):
+        x = self.B(idx)
+        x = self.N(x)
+        return x
+
+    def fix_indices(self):
+        self.B.fix_indices()
 
 
 
-def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=100, save_path='', optimizer=None, norm=2, verbose=False, device='cuda'):
+
+def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=100, lr=0.01, save_path='', optimizer=None, loss_function=torch.nn.functional.mse_loss, verbose=False, device='cuda', name=''):
     
     if optimizer is None:
-        optimizer=torch.optim.Adam(apx.parameters(),lr=0.01)
+        if hasattr(apx.B,'feats'):
+            optimizer=torch.optim.AdamW([
+                            {'params': apx.B.feats,'weight_decay':1},
+                            {'params': [parameter for parameter in apx.parameters() if parameter is not apx.B.feats]}
+                        ], lr=lr, weight_decay=0)
+        elif (hasattr(apx.B,'feats0')and hasattr(apx.B,'feats1')):
+            optimizer=torch.optim.AdamW([
+                            {'params': [apx.B.feats0,apx.B.feats1],'weight_decay':1},
+                            {'params': [parameter for parameter in apx.parameters() if (parameter is not apx.B.feats0) and (parameter is not apx.B.feats1)]}
+                        ], lr=lr, weight_decay=0)
+        else:
+            optimizer=torch.optim.Adam(apx.parameters(), lr=lr, weight_decay=0)
 
-    if norm==2:
-        name = str(apx.B.levels) + '_' + str(apx.B.feature_dim) + '.pth'
-    else:
-        name = str(apx.B.levels) + '_' + str(apx.B.feature_dim) + '_norm' + norm + '.pth'
+    name = str(apx.B.levels) + '_' + str(apx.B.feature_dim) + name + '.pth'
 
     h=[]
     run={}
@@ -166,7 +286,7 @@ def train_apx(apx, embeddings, epochs=1000, batch_size=2**10, checkpoint_every=1
             embed_preds = apx(positions)
 
             embeds = embeddings[positions]
-            loss=torch.mean(torch.pow(torch.abs(embed_preds)-embeds, norm))
+            loss=loss_function(embed_preds,embeds)
 
             loss.backward()
             optimizer.step()
@@ -206,15 +326,15 @@ def calc_size(x):
    return tot
 
 
-def load_runs(runs_folder):
+def load_runs(runs_folder, fixed=False):
 
     runs = []
     for name in os.listdir(runs_folder):
-        run = load_run(runs_folder + name)
+        run = load_run(runs_folder + name, fixed)
         runs.append(run)
     return runs
 
-def load_run(filename):
+def load_run(filename, fixed=False):
 
     run=torch.load(filename)
 
@@ -224,25 +344,51 @@ def load_run(filename):
     nn_levels = len(nn_weights)-1
     neurons=len(nn_weights[0])
     embeddings_size=len(nn_weights[-1])
-    feats=run['apx']['B.feats']
-    if feats is not None:
-        n_embeddings=feats.shape[1]
-    else:
-        n_embeddings=feats.shape[1]
     bits = int(math.log2(run['apx']['B.dictionary'].shape[1]))
+    if 'B.feats' in run['apx']:
+        feats=run['apx']['B.feats']
+        if feats is not None:
+            n_embeddings=feats.shape[1]
+        else:
+            n_embeddings=run['apx']['B.fixed_indices'].shape[1]
 
-    apx = ApproxEmbed(levels = levels, 
-                feature_dim = channels,
-                num_words = n_embeddings,
-                output_dims = embeddings_size,
-                feature_std = 0.1,
-                feature_bias = 0.0,
-                codebook_bitwidth=bits,
-                neurons = neurons,
-                nn_levels = nn_levels)
+        apx = ApproxEmbed(levels = levels, 
+                    feature_dim = channels,
+                    num_words = n_embeddings,
+                    output_dims = embeddings_size,
+                    feature_std = 0.1,
+                    feature_bias = 0.0,
+                    codebook_bitwidth=bits,
+                    neurons = neurons,
+                    nn_levels = nn_levels)
 
-    if feats is None:
-        apx.fix_indices()
+        if feats is None:
+            apx.fix_indices()
+        apx.load_state_dict(run['apx'])
+        if fixed:
+            apx.fix_indices()
+    else:
+        feats0=run['apx']['B.feats0']
+        if feats0 is not None:
+            n_embeddings=feats0.shape[1]
+        else:
+            n_embeddings=run['apx']['B.fixed_indices'].shape[1]
+        
+        apx = ApproxEmbed2(levels = levels, 
+                    feature_dim = channels,
+                    num_words = n_embeddings,
+                    output_dims = embeddings_size,
+                    feature_std = 0.1,
+                    feature_bias = 0.0,
+                    codebook_bitwidth=bits,
+                    neurons = neurons,
+                    nn_levels = nn_levels)
+        if feats0 is None:
+            apx.fix_indices()
+        apx.load_state_dict(run['apx'])
+        if fixed:
+            apx.fix_indices()
+        
     
     run['apx']=apx
     return run
@@ -255,21 +401,21 @@ def plot_compare_result_runs(runs, embeddings, bits=8):
             levs[run['level']]=[]
         levs[run['level']].append(run)
 
-    LEVELS = list(levs.keys())
+    LEVELS = np.sort(np.array(list(levs.keys())))
     max_s=torch.max(embeddings).item()
 
     color = plt.cm.viridis(1-np.linspace(0, 1, len(LEVELS)))
 
-    fig, ax = plt.subplots(figsize=(15,10))
-    for l in levs.keys():
+    fig, ax = plt.subplots(figsize=(7,5))
+    for l in np.sort(np.array(list(levs.keys())),axis=0):
         print(l)
         size= np.array([calc_size(list(run['apx'].parameters())) for run in levs[l]])/1e6
         loss = np.array([np.min(run['loss']) for run in levs[l]])
         idx = np.argsort(size)
-        snr = 10*np.log10(max_s/loss)
+        #snr = 10*np.log10(max_s/loss)
         txt = [run['channel'] for run in levs[l]]
-        ax.plot(size[idx], snr[idx], '.', color=color[np.where(np.array(LEVELS)==l)])
-        ax.plot(size[idx], snr[idx], color=color[np.where(np.array(LEVELS)==l)])
+        ax.plot(size[idx], loss[idx], '.', color=color[np.where(np.array(LEVELS)==l)])
+        ax.plot(size[idx], loss[idx], color=color[np.where(np.array(LEVELS)==l)], label=f"{l} levels")
         
 
     S,V,D = np.linalg.svd(embeddings.detach().cpu(),full_matrices=False)
@@ -279,10 +425,12 @@ def plot_compare_result_runs(runs, embeddings, bits=8):
 
     size=np.array([calc_size([S[:,:n],V[:n],D[:n]]) for n in N])/1e6
     loss=np.array([torch.mean(torch.square(torch.tensor((S[:,:n]*V[:n])@D[:n],device=embeddings.device)-embeddings)).item() for n in N])
-    snr = 10*np.log10(max_s/loss)
+    #snr = 10*np.log10(max_s/loss)
 
-    ax.plot(size, snr,'.', color='r')
-    ax.plot(size, snr, color='r')
+    ax.plot(size, loss,'.', color='r')
+    ax.plot(size, loss, color='r', label=f"SVD")
 
     plt.xlabel('Size MB')
-    plt.ylabel('PSNR')
+    plt.ylabel('MSE')
+    plt.yscale('log')
+    plt.legend()

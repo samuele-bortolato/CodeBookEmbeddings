@@ -110,7 +110,17 @@ def Glue(model, tokenizer, task_name, args, epochs=10, lr=1e-5, batch_size=32, s
             args['max']=1
 
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(),lr=lr)
+    
+    if hasattr(model.bert.embeddings.word_embeddings,'B'):
+        if model.bert.embeddings.word_embeddings.B.feats is not None:
+            optimizer = torch.optim.AdamW([
+                                {'params': model.bert.embeddings.word_embeddings.B.feats,'weight_decay':1},
+                                {'params': [parameter for parameter in model.parameters() if parameter is not model.bert.embeddings.word_embeddings.B.feats]}
+                            ], lr=lr, weight_decay=0)
+        else: #already freezed
+            optimizer = torch.optim.Adam(model.parameters(),lr=lr)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(),lr=lr)
 
     history=[]
     val_history=[]
